@@ -14,18 +14,6 @@ client.once(Events.ClientReady, readyClient => {
   startLiveChecker(readyClient);
 });
 
-async function main() {
-  await mongoose.connect(config.mongoUri);
-  console.log("Connected to MongoDB");
-
-  await client.login(config.discordToken);
-}
-
-main().catch(error => {
-  console.error("Startup failed:", error);
-  process.exit(1);
-});
-
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== "tiktok") return;
@@ -35,15 +23,42 @@ client.on(Events.InteractionCreate, async interaction => {
   } catch (error) {
     console.error("Command failed:", error);
 
-    // Admin still gets feedback instead of "application did not respond"
-    const message = {
-      content: "Something went wrong. Try again.",
-      flags: MessageFlags.Ephemeral,
-    } as const;
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp(message);
-    } else {
-      await interaction.reply(message);
+    // The interaction may have expired or been answered already; never let this crash the bot
+    try {
+      const message = {
+        content: "Something went wrong. Try again.",
+        flags: MessageFlags.Ephemeral,
+      } as const;
+
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp(message);
+      } else {
+        await interaction.reply(message);
+      }
+    } catch (replyError) {
+      console.error("Could not send error reply:", replyError);
     }
   }
+});
+
+// Log Discord connection problems instead of crashing
+client.on(Events.Error, error => {
+  console.error("Discord client error:", error);
+});
+
+async function main() {
+  await mongoose.connect(config.mongoUri);
+  console.log("Connected to MongoDB");
+
+  await client.login(config.discordToken);
+}
+
+// Last safety net: log any missed promise error instead of taking the bot down
+process.on("unhandledRejection", error => {
+  console.error("Unhandled promise rejection:", error);
+});
+
+main().catch(error => {
+  console.error("Startup failed:", error);
+  process.exit(1);
 });
