@@ -234,3 +234,9 @@ export function startLiveChecker(client: Client) {
 
   void runCycle();
 }
+// Used by /tiktok add to confirm the account and show its display name
+export async function lookupCreator(username: string): Promise<string | null> {
+  const connection = createConnection(username);
+  const info = await readLiveInfo(connection, username);
+  return info?.user?.nickname ?? null;
+}

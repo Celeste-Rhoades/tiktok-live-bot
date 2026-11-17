@@ -9,6 +9,7 @@ import {
 import { mongo } from "mongoose";
 import { GuildSettings } from "../model/GuildSettings.js";
 import { TrackedCreator } from "../model/TrackedCreator.js";
+import { lookupCreator } from "../services/liveChecker.js";
 
 export const tiktokCommand = new SlashCommandBuilder()
   .setName("tiktok")
@@ -59,6 +60,7 @@ export const tiktokCommand = new SlashCommandBuilder()
   .addSubcommand(sub =>
     sub.setName("list").setDescription("Show creators tracked in this server"),
   );
+
 // TikTok usernames: letters, numbers, periods, underscores, 2–24 characters
 const USERNAME_PATTERN = /^[a-z0-9._]{2,24}$/;
 
@@ -90,6 +92,7 @@ export async function handleTiktokCommand(
     return;
   }
 
+  // ---- add: this section changed ----
   if (subcommand === "add") {
     const settings = await GuildSettings.findOne({ guildId });
     if (!settings) {
@@ -113,6 +116,9 @@ export async function handleTiktokCommand(
 
     const role = interaction.options.getRole("role", true);
 
+    // TikTok lookup can take a few seconds, and Discord needs a response within 3
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
     try {
       await TrackedCreator.create({
         guildId,
@@ -122,22 +128,26 @@ export async function handleTiktokCommand(
     } catch (error) {
       // 11000 is MongoDB's duplicate key error, from the unique index
       if (error instanceof mongo.MongoServerError && error.code === 11000) {
-        await interaction.reply({
-          content: `@${username} is already being tracked here.`,
-          flags: MessageFlags.Ephemeral,
-        });
+        await interaction.editReply(
+          `@${username} is already being tracked here.`,
+        );
         return;
       }
       throw error;
     }
 
-    await interaction.reply({
-      content: `Now tracking @${username}. Alerts will ping <@&${role.id}>.`,
-      flags: MessageFlags.Ephemeral,
-      allowedMentions: { parse: [] },
-    });
+    const nickname = await lookupCreator(username).catch(() => null);
+    const profileUrl = `https://www.tiktok.com/@${username}`;
+
+    const content = nickname
+      ? `Now tracking **${nickname}** (@${username}). Alerts will ping <@&${role.id}>.`
+      : `Now tracking @${username}. Alerts will ping <@&${role.id}>.\n` +
+        `I couldn't confirm this account right now (they may just be offline). Check the spelling: <${profileUrl}>`;
+
+    await interaction.editReply({ content, allowedMentions: { parse: [] } });
     return;
   }
+  // ---- end of changed section ----
 
   if (subcommand === "remove") {
     const username = normalizeUsername(
