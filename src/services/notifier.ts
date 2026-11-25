@@ -1,5 +1,6 @@
 import {
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
@@ -8,6 +9,7 @@ import {
 import { GuildSettings } from "../model/GuildSettings.js";
 import type { ITrackedCreator } from "../model/TrackedCreator.js";
 import type { LiveDetails } from "../types.js";
+import { addGlowFrame } from "./glowFrame.js";
 
 // Card colors by LIVE type; change these to restyle every alert
 const COLORS = {
@@ -18,6 +20,14 @@ const COLORS = {
 
 // Discord rejects embed titles over 256 characters
 const MAX_TITLE_LENGTH = 256;
+
+// Name the framed image is uploaded under, so the embed can point at it
+const IMAGE_FILE_NAME = "live.png";
+
+export interface SentAlert {
+  channelId: string;
+  messageId: string;
+}
 
 function getLabels(live: LiveDetails): string[] {
   const labels: string[] = [];
@@ -38,26 +48,31 @@ function getImage(live: LiveDetails): string | null {
   return live.coverUrl ?? live.avatarUrl;
 }
 
-export async function sendLiveAlert(
-  client: Client,
+function getLiveUrl(creator: ITrackedCreator): string {
+  return `https://www.tiktok.com/@${creator.tiktokUsername}/live`;
+}
+
+async function getAlertChannel(client: Client, channelId: string) {
+  const channel = await client.channels.fetch(channelId);
+  if (!channel || !channel.isSendable()) return null;
+  return channel;
+}
+
+// Frame once per stream and share it, instead of once per server
+export async function renderAlertImage(
+  live: LiveDetails,
+): Promise<Buffer | null> {
+  const imageUrl = getImage(live);
+  return imageUrl ? addGlowFrame(imageUrl) : null;
+}
+
+// Shared by new alerts and edits, so an edited card looks the same as a fresh one
+function buildAlert(
   creator: ITrackedCreator,
   live: LiveDetails,
+  framedImage: Buffer | null,
 ) {
-  const settings = await GuildSettings.findOne({ guildId: creator.guildId });
-  if (!settings) {
-    console.warn(`No alert channel set for server ${creator.guildId}`);
-    return;
-  }
-
-  const channel = await client.channels.fetch(settings.alertChannelId);
-  if (!channel || !channel.isSendable()) {
-    console.warn(
-      `Can't post in channel ${settings.alertChannelId} (server ${creator.guildId})`,
-    );
-    return;
-  }
-
-  const liveUrl = `https://www.tiktok.com/@${creator.tiktokUsername}/live`;
+  const liveUrl = getLiveUrl(creator);
   const labels = getLabels(live);
   const labelText = labels.length ? ` (${labels.join(", ")})` : "";
 
@@ -72,8 +87,16 @@ export async function sendLiveAlert(
     .setURL(liveUrl)
     .setTimestamp();
 
-  const image = getImage(live);
-  if (image) embed.setImage(image);
+  const files: AttachmentBuilder[] = [];
+  const plainImage = getImage(live);
+
+  if (framedImage) {
+    // Upload the framed image with the message and point the embed at it
+    files.push(new AttachmentBuilder(framedImage, { name: IMAGE_FILE_NAME }));
+    embed.setImage(`attachment://${IMAGE_FILE_NAME}`);
+  } else if (plainImage) {
+    embed.setImage(plainImage);
+  }
 
   const watchButton = new ButtonBuilder()
     .setLabel("Watch Stream")
@@ -84,11 +107,86 @@ export async function sendLiveAlert(
     watchButton,
   );
 
-  await channel.send({
+  return {
     content: `<@&${creator.roleId}> **${live.nickname}** is LIVE${labelText}!`,
     embeds: [embed],
     components: [buttons],
+    files,
+  };
+}
+
+export async function sendLiveAlert(
+  client: Client,
+  creator: ITrackedCreator,
+  live: LiveDetails,
+  framedImage: Buffer | null,
+): Promise<SentAlert | null> {
+  const settings = await GuildSettings.findOne({ guildId: creator.guildId });
+  if (!settings) {
+    console.warn(`No alert channel set for server ${creator.guildId}`);
+    return null;
+  }
+
+  const channel = await getAlertChannel(client, settings.alertChannelId);
+  if (!channel) {
+    console.warn(
+      `Can't post in channel ${settings.alertChannelId} (server ${creator.guildId})`,
+    );
+    return null;
+  }
+
+  const message = await channel.send({
+    ...buildAlert(creator, live, framedImage),
     // Only ping the role chosen for this creator, never @everyone
     allowedMentions: { roles: [creator.roleId] },
+  });
+
+  return { channelId: channel.id, messageId: message.id };
+}
+
+// A LIVE switched to or from Super Fan only after the alert went out
+export async function sendModeUpdate(
+  client: Client,
+  creator: ITrackedCreator,
+  live: LiveDetails,
+) {
+  const channelId =
+    creator.alertChannelId ??
+    (await GuildSettings.findOne({ guildId: creator.guildId }))?.alertChannelId;
+  if (!channelId) return;
+
+  const channel = await getAlertChannel(client, channelId);
+  if (!channel) {
+    console.warn(
+      `Can't post in channel ${channelId} (server ${creator.guildId})`,
+    );
+    return;
+  }
+
+  // Edits never ping anyone, so the original card can be refreshed quietly
+  if (creator.alertMessageId) {
+    try {
+      const framedImage = await renderAlertImage(live);
+      await channel.messages.edit(creator.alertMessageId, {
+        ...buildAlert(creator, live, framedImage),
+        // Drop the old image so the card doesn't end up with two
+        attachments: [],
+        allowedMentions: { parse: [] },
+      });
+    } catch (error) {
+      console.warn(
+        `Couldn't update the alert card for @${creator.tiktokUsername}:`,
+        error,
+      );
+    }
+  }
+
+  const change = live.isSubOnly
+    ? `**${live.nickname}** switched their LIVE to Super Fan only.`
+    : `**${live.nickname}** opened their LIVE back up to everyone.`;
+
+  await channel.send({
+    content: `${change} <${getLiveUrl(creator)}>`,
+    allowedMentions: { parse: [] },
   });
 }

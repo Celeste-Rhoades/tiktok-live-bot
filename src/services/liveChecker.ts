@@ -6,7 +6,7 @@ import {
 } from "tiktok-live-connector";
 import { config } from "../config.js";
 import { TrackedCreator } from "../model/TrackedCreator.js";
-import { sendLiveAlert } from "./notifier.js";
+import { renderAlertImage, sendLiveAlert, sendModeUpdate } from "./notifier.js";
 import type { LiveDetails } from "../types.js";
 
 // Same shape from both the TikTok API and the /live web page
@@ -145,6 +145,45 @@ async function markOffline(username: string) {
   );
 }
 
+// Super Fan only can be switched on or off mid-stream; every check already reports it
+async function announceModeChanges(
+  client: Client,
+  username: string,
+  current: LiveDetails,
+) {
+  const changeFilter = {
+    tiktokUsername: username,
+    lastRoomId: current.roomId,
+    "lastLive.isSubOnly": !current.isSubOnly,
+  };
+
+  const changed = await TrackedCreator.find(changeFilter);
+
+  for (const creator of changed) {
+    // Claim the change before posting, same as new alerts, so it's announced once
+    const claim = await TrackedCreator.updateOne(
+      { ...changeFilter, _id: creator._id },
+      { $set: { "lastLive.isSubOnly": current.isSubOnly } },
+    );
+    if (claim.modifiedCount === 0 || !creator.lastLive) continue;
+
+    // Keep the announced title/cover/18+ and only flip the Super Fan setting
+    const updated: LiveDetails = {
+      ...creator.lastLive,
+      isSubOnly: current.isSubOnly,
+    };
+
+    try {
+      await sendModeUpdate(client, creator, updated);
+    } catch (error) {
+      console.error(
+        `Mode update failed for @${username} in server ${creator.guildId}:`,
+        error,
+      );
+    }
+  }
+}
+
 // Returns false when TikTok couldn't be read, so the cycle can spot a full block
 async function checkCreator(
   client: Client,
@@ -166,6 +205,8 @@ async function checkCreator(
     return true;
   }
 
+  await announceModeChanges(client, username, basic);
+
   // Every server tracking this creator that hasn't been alerted for this stream yet
   const pending = await TrackedCreator.find({
     tiktokUsername: username,
@@ -177,16 +218,38 @@ async function checkCreator(
 
   const live = await addRoomDetails(connection, username, basic);
 
+  // Frame the picture once, even if several servers get this alert
+  const framedImage = await renderAlertImage(live);
+
   for (const creator of pending) {
     // Claim the alert before sending so a restart or overlap can never double-ping
     const claim = await TrackedCreator.updateOne(
       { _id: creator._id, lastRoomId: { $ne: live.roomId } },
-      { $set: { isLive: true, lastRoomId: live.roomId } },
+      {
+        $set: {
+          isLive: true,
+          lastRoomId: live.roomId,
+          lastLive: live,
+          alertChannelId: null,
+          alertMessageId: null,
+        },
+      },
     );
     if (claim.modifiedCount === 0) continue;
 
     try {
-      await sendLiveAlert(client, creator, live);
+      const sent = await sendLiveAlert(client, creator, live, framedImage);
+      if (sent) {
+        await TrackedCreator.updateOne(
+          { _id: creator._id },
+          {
+            $set: {
+              alertChannelId: sent.channelId,
+              alertMessageId: sent.messageId,
+            },
+          },
+        );
+      }
     } catch (error) {
       console.error(
         `Alert failed for @${username} in server ${creator.guildId}:`,
@@ -234,6 +297,7 @@ export function startLiveChecker(client: Client) {
 
   void runCycle();
 }
+
 // Used by /tiktok add to confirm the account and show its display name
 export async function lookupCreator(username: string): Promise<string | null> {
   const connection = createConnection(username);
