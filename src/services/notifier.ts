@@ -15,7 +15,7 @@ import { addGlowFrame } from "./glowFrame.js";
 const COLORS = {
   regular: 0x00ffff,
   ageRestricted: 0xff00ff,
-  superFan: 0xc87df2,
+  superFan: 0x39ff14,
 } as const;
 
 // Discord rejects embed titles over 256 characters
@@ -66,8 +66,8 @@ export async function renderAlertImage(
   return imageUrl ? addGlowFrame(imageUrl) : null;
 }
 
-// Shared by new alerts and edits, so an edited card looks the same as a fresh one
-function buildAlert(
+// Shared by new alerts, edits, and the preview script, so every card looks the same
+export function buildAlert(
   creator: ITrackedCreator,
   live: LiveDetails,
   framedImage: Buffer | null,
