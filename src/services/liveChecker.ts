@@ -46,6 +46,11 @@ const PAUSE_BETWEEN_CREATORS_MS = 1_000;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Shutdown state, so a redeploy can let the current check finish instead of cutting it off
+let stopping = false;
+let nextCycleTimer: NodeJS.Timeout | null = null;
+let currentCycle: Promise<void> | null = null;
+
 function createConnection(username: string) {
   return new TikTokLiveConnection(username, {
     session: {
@@ -177,8 +182,13 @@ async function announceModeChanges(
       await sendModeUpdate(client, creator, updated);
     } catch (error) {
       console.error(
-        `Mode update failed for @${username} in server ${creator.guildId}:`,
+        `Mode update failed for @${username} in server ${creator.guildId}, will retry next check:`,
         error,
+      );
+      // Undo the claim so the next check tries again
+      await TrackedCreator.updateOne(
+        { _id: creator._id, lastRoomId: current.roomId },
+        { $set: { "lastLive.isSubOnly": !current.isSubOnly } },
       );
     }
   }
@@ -252,8 +262,20 @@ async function checkCreator(
       }
     } catch (error) {
       console.error(
-        `Alert failed for @${username} in server ${creator.guildId}:`,
+        `Alert failed for @${username} in server ${creator.guildId}, will retry next check:`,
         error,
+      );
+      // Put back what was there before the claim, so the next check sees this stream as new
+      await TrackedCreator.updateOne(
+        { _id: creator._id, lastRoomId: live.roomId },
+        {
+          $set: {
+            lastRoomId: creator.lastRoomId,
+            lastLive: creator.lastLive,
+            alertChannelId: creator.alertChannelId,
+            alertMessageId: creator.alertMessageId,
+          },
+        },
       );
     }
   }
@@ -267,6 +289,9 @@ async function checkAllCreators(client: Client) {
   let pagesRead = 0;
 
   for (const username of usernames) {
+    // On shutdown, stop between creators rather than in the middle of one
+    if (stopping) return;
+
     try {
       if (await checkCreator(client, username)) pagesRead++;
     } catch (error) {
@@ -285,17 +310,26 @@ async function checkAllCreators(client: Client) {
 
 export function startLiveChecker(client: Client) {
   const runCycle = async () => {
-    try {
-      await checkAllCreators(client);
-    } catch (error) {
+    currentCycle = checkAllCreators(client).catch(error => {
       console.error("Live check cycle failed:", error);
-    } finally {
-      // Schedule the next run only after this one finishes, so cycles never overlap
-      setTimeout(runCycle, config.checkIntervalMs);
+    });
+    await currentCycle;
+    currentCycle = null;
+
+    // Schedule the next run only after this one finishes, so cycles never overlap
+    if (!stopping) {
+      nextCycleTimer = setTimeout(runCycle, config.checkIntervalMs);
     }
   };
 
   void runCycle();
+}
+
+// Lets a shutdown wait for the current creator to finish instead of cutting off an alert
+export async function stopLiveChecker() {
+  stopping = true;
+  if (nextCycleTimer) clearTimeout(nextCycleTimer);
+  await currentCycle;
 }
 
 // Used by /tiktok add to confirm the account and show its display name

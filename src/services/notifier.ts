@@ -4,7 +4,9 @@ import {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  escapeMarkdown,
   type Client,
+  type Message,
 } from "discord.js";
 import { GuildSettings } from "../model/GuildSettings.js";
 import type { ITrackedCreator } from "../model/TrackedCreator.js";
@@ -50,6 +52,11 @@ function getImage(live: LiveDetails): string | null {
 
 function getLiveUrl(creator: ITrackedCreator): string {
   return `https://www.tiktok.com/@${creator.tiktokUsername}/live`;
+}
+
+// Creator names can contain * or _, which would otherwise scramble the bold text
+function safeName(live: LiveDetails): string {
+  return escapeMarkdown(live.nickname);
 }
 
 async function getAlertChannel(client: Client, channelId: string) {
@@ -108,7 +115,7 @@ export function buildAlert(
   );
 
   return {
-    content: `<@&${creator.roleId}> **${live.nickname}** is LIVE${labelText}!`,
+    content: `<@&${creator.roleId}> **${safeName(live)}** is LIVE${labelText}!`,
     embeds: [embed],
     components: [buttons],
     files,
@@ -135,11 +142,28 @@ export async function sendLiveAlert(
     return null;
   }
 
-  const message = await channel.send({
-    ...buildAlert(creator, live, framedImage),
-    // Only ping the role chosen for this creator, never @everyone
-    allowedMentions: { roles: [creator.roleId] },
-  });
+  // Only ping the role chosen for this creator, never @everyone
+  const allowedMentions = { roles: [creator.roleId] };
+  let message: Message;
+
+  try {
+    message = await channel.send({
+      ...buildAlert(creator, live, framedImage),
+      allowedMentions,
+    });
+  } catch (error) {
+    if (!framedImage) throw error;
+
+    // Usually a missing Attach Files permission; a plain image link needs no upload
+    console.warn(
+      `Glow image upload failed in server ${creator.guildId}, sending the plain image:`,
+      error,
+    );
+    message = await channel.send({
+      ...buildAlert(creator, live, null),
+      allowedMentions,
+    });
+  }
 
   return { channelId: channel.id, messageId: message.id };
 }
@@ -165,25 +189,34 @@ export async function sendModeUpdate(
 
   // Edits never ping anyone, so the original card can be refreshed quietly
   if (creator.alertMessageId) {
+    const framedImage = await renderAlertImage(live);
     try {
-      const framedImage = await renderAlertImage(live);
       await channel.messages.edit(creator.alertMessageId, {
         ...buildAlert(creator, live, framedImage),
         // Drop the old image so the card doesn't end up with two
         attachments: [],
         allowedMentions: { parse: [] },
       });
-    } catch (error) {
-      console.warn(
-        `Couldn't update the alert card for @${creator.tiktokUsername}:`,
-        error,
-      );
+    } catch {
+      try {
+        // Retry with the plain image in case the upload was the problem
+        await channel.messages.edit(creator.alertMessageId, {
+          ...buildAlert(creator, live, null),
+          attachments: [],
+          allowedMentions: { parse: [] },
+        });
+      } catch (error) {
+        console.warn(
+          `Couldn't update the alert card for @${creator.tiktokUsername}:`,
+          error,
+        );
+      }
     }
   }
 
   const change = live.isSubOnly
-    ? `**${live.nickname}** switched their LIVE to Super Fan only.`
-    : `**${live.nickname}** opened their LIVE back up to everyone.`;
+    ? `**${safeName(live)}** switched their LIVE to Super Fan only.`
+    : `**${safeName(live)}** opened their LIVE back up to everyone.`;
 
   await channel.send({
     content: `${change} <${getLiveUrl(creator)}>`,
